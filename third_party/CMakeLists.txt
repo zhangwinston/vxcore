@@ -205,8 +205,8 @@ function(vxcore_add_webdav_dependencies)
       endforeach()
     endif()
     FetchContent_Declare(vxcore_curl
-      URL https://github.com/curl/curl/releases/download/curl-8_22_0/curl-8.22.0.tar.gz
-      URL_HASH SHA256=d54dd598bf05927a726deb38df31c6a255ba83ff1de57c5d1464dac3ed8f44a1
+      URL https://github.com/curl/curl/releases/download/curl-8_17_0/curl-8.17.0.tar.gz
+      URL_HASH SHA256=e8e74cdeefe5fb78b3ae6e90cd542babf788fa9480029cfcee6fd9ced42b7910
     )
     FetchContent_MakeAvailable(vxcore_curl)
     if(CMAKE_VERSION VERSION_LESS 3.21)

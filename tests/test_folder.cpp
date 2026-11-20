@@ -118,6 +118,11 @@ bool SetMtimeMillis(const std::string &path, int64_t unix_millis) {
   return !ec;
 }
 
+std::string ReadTestFile(const std::string &path) {
+  std::ifstream stream(utf8_to_fs_path(path), std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+}
+
 bool WriteTestFile(const std::string &path, const std::string &content = "x") {
   std::ofstream stream(PathFromUtf8ForTest(path), std::ios::binary);
   stream << content;
@@ -2639,6 +2644,209 @@ int test_recycle_bin_folder_delete() {
   std::cout << "  ✓ test_recycle_bin_folder_delete passed" << std::endl;
   return 0;
 }
+
+int test_folder_delete_missing_descendant_metadata() {
+  const std::string root = get_test_path("test_delete_missing_metadata_nb");
+  cleanup_test_dir(root);
+  const std::string folder =
+      "averylonglonglonglonglonglonglonglonglonglongllllllllloooooooooooooooooooooooooo folder";
+  const std::string child = folder + "/abc";
+  const std::string nested = child + "/文件夹里面又有文件夹";
+  VxCoreContextHandle ctx = nullptr;
+  ASSERT_EQ(vxcore_context_create(nullptr, &ctx), VXCORE_OK);
+  char *notebook_id = nullptr;
+  ASSERT_EQ(vxcore_notebook_create(ctx, root.c_str(), R"({"name":"Missing metadata"})",
+                                   VXCORE_NOTEBOOK_BUNDLED, &notebook_id),
+            VXCORE_OK);
+  char *id = nullptr;
+  ASSERT_EQ(vxcore_folder_create(ctx, notebook_id, ".", folder.c_str(), &id), VXCORE_OK);
+  vxcore_string_free(id);
+  ASSERT_EQ(vxcore_folder_create(ctx, notebook_id, folder.c_str(), "abc", &id), VXCORE_OK);
+  vxcore_string_free(id);
+  ASSERT_EQ(vxcore_folder_create(ctx, notebook_id, folder.c_str(), "phantom", &id), VXCORE_OK);
+  vxcore_string_free(id);
+  create_directory(root + "/" + nested);
+  ASSERT(WriteTestFile(root + "/" + child + "/abc.txt", "preserved ordinary body"));
+  ASSERT(WriteTestFile(root + "/" + nested + "/note.md.vswp", "ordinary swap"));
+  ASSERT_EQ(vxcore_notebook_close(ctx, notebook_id), VXCORE_OK);
+  vxcore_string_free(notebook_id);
+  cleanup_test_dir(root + "/vx_notebook/contents/" + child);
+  ASSERT(std::filesystem::remove(
+      utf8_to_fs_path(root + "/vx_notebook/contents/" + folder + "/phantom/vx.json")));
+  cleanup_test_dir(root + "/" + folder + "/phantom");
+  ASSERT_EQ(vxcore_notebook_open(ctx, root.c_str(), &notebook_id), VXCORE_OK);
+
+  // Copy must not inherit deletion's tolerance or publish an incomplete copy.
+  char *copy_id = nullptr;
+  ASSERT_EQ(vxcore_node_copy(ctx, notebook_id, folder.c_str(), ".", "copy", &copy_id),
+            VXCORE_ERR_NOT_FOUND);
+  ASSERT_NULL(copy_id);
+  ASSERT_FALSE(path_exists(root + "/copy"));
+  ASSERT_EQ(vxcore_node_delete(ctx, notebook_id, folder.c_str()), VXCORE_OK);
+  ASSERT_FALSE(path_exists(root + "/" + folder));
+  ASSERT_FALSE(path_exists(root + "/vx_notebook/contents/" + folder));
+  ASSERT_FALSE(RootListingContainsFolder(ctx, notebook_id, folder));
+  const std::string recycle = root + "/vx_notebook/recycle_bin/";
+  ASSERT_EQ(ReadTestFile(recycle + child + "/abc.txt"), "preserved ordinary body");
+  ASSERT_EQ(ReadTestFile(recycle + nested + "/note.md.vswp"), "ordinary swap");
+  ASSERT_EQ(vxcore_notebook_close(ctx, notebook_id), VXCORE_OK);
+  vxcore_string_free(notebook_id);
+  ASSERT_EQ(vxcore_notebook_open(ctx, root.c_str(), &notebook_id), VXCORE_OK);
+  ASSERT_FALSE(RootListingContainsFolder(ctx, notebook_id, folder));
+  const auto disk_root =
+      nlohmann::json::parse(ReadTestFile(root + "/vx_notebook/contents/vx.json"));
+  ASSERT_EQ(disk_root["folders"], nlohmann::json::array());
+  vxcore_string_free(notebook_id);
+  vxcore_context_destroy(ctx);
+  cleanup_test_dir(root);
+  return 0;
+}
+
+int test_folder_delete_missing_metadata_protection() {
+  enum class Hazard {
+    Encrypted,
+    Swap,
+    Metadata,
+    Malformed,
+    Junction,
+    MetadataJunction,
+    Marker,
+    Protected
+  };
+  for (const auto hazard :
+       {Hazard::Encrypted, Hazard::Swap, Hazard::Metadata, Hazard::Malformed, Hazard::Junction,
+        Hazard::MetadataJunction, Hazard::Marker, Hazard::Protected}) {
+    std::cout << "  Missing-metadata protection case " << static_cast<int>(hazard) << std::endl;
+    const std::string root = get_test_path("test_delete_missing_metadata_protection_nb");
+    cleanup_test_dir(root);
+    VxCoreContextHandle ctx = nullptr;
+    ASSERT_EQ(vxcore_context_create(nullptr, &ctx), VXCORE_OK);
+    char *notebook_id = nullptr;
+    ASSERT_EQ(vxcore_notebook_create(ctx, root.c_str(), R"({"name":"Protection"})",
+                                     VXCORE_NOTEBOOK_BUNDLED, &notebook_id),
+              VXCORE_OK);
+    char *id = nullptr;
+    ASSERT_EQ(vxcore_folder_create(ctx, notebook_id, ".", "top", &id), VXCORE_OK);
+    vxcore_string_free(id);
+    ASSERT_EQ(vxcore_folder_create(ctx, notebook_id, "top", "abc", &id), VXCORE_OK);
+    vxcore_string_free(id);
+    ASSERT_EQ(vxcore_folder_create(ctx, notebook_id, "top/abc", "nested", &id), VXCORE_OK);
+    vxcore_string_free(id);
+    ASSERT_EQ(vxcore_file_create(ctx, notebook_id, "top", "note.md", &id), VXCORE_OK);
+    vxcore_string_free(id);
+    ASSERT(WriteTestFile(root + "/top/note.md", "keep parent body"));
+    ASSERT(WriteTestFile(root + "/top/abc/nested/keep.txt", "keep child body"));
+    std::string ciphertext;
+    if (hazard == Hazard::Protected) {
+      VxCoreEncryptionSetupHandle setup = nullptr;
+      ASSERT_EQ(vxcore_encryption_prepare_notebook(ctx, notebook_id, nullptr, "test", 4, &setup),
+                VXCORE_OK);
+      ASSERT_EQ(vxcore_encryption_commit_notebook(ctx, setup), VXCORE_OK);
+      ASSERT_EQ(vxcore_encryption_create_note(ctx, notebook_id, "top", "secret.md", "markdown",
+                                              "private body", 12, &id),
+                VXCORE_OK);
+      vxcore_string_free(id);
+      ciphertext = ReadTestFile(root + "/top/secret.md.vne");
+    }
+    ASSERT_EQ(vxcore_notebook_close(ctx, notebook_id), VXCORE_OK);
+    vxcore_string_free(notebook_id);
+    const std::string metadata = root + "/vx_notebook/contents/top/abc";
+    const std::string grandchild_config = ReadTestFile(metadata + "/nested/vx.json");
+    if (hazard == Hazard::Metadata) {
+      ASSERT(std::filesystem::remove(utf8_to_fs_path(metadata + "/vx.json")));
+    } else if (hazard == Hazard::Malformed) {
+      ASSERT(WriteTestFile(metadata + "/vx.json", "{broken"));
+    } else {
+      cleanup_test_dir(metadata);
+    }
+    std::string protected_path;
+    std::string link;
+    auto expected = VXCORE_ERR_ENCRYPTION_FORMAT;
+    if (hazard == Hazard::Encrypted || hazard == Hazard::Swap) {
+      protected_path = root + "/top/abc/nested/" +
+                       (hazard == Hazard::Encrypted ? ".hidden.VNE" : "note.md.VNE.VSWP");
+      ASSERT(WriteTestFile(protected_path, "do not discard protected bytes"));
+    } else if (hazard == Hazard::Metadata) {
+      expected = VXCORE_ERR_NOT_FOUND;
+    } else if (hazard == Hazard::Malformed) {
+      expected = VXCORE_ERR_JSON_PARSE;
+    } else if (hazard == Hazard::Junction || hazard == Hazard::MetadataJunction) {
+      create_directory(root + "/outside");
+      protected_path = root + "/outside/keep.vne";
+      ASSERT(WriteTestFile(protected_path, "do not discard protected bytes"));
+      link = hazard == Hazard::Junction ? root + "/top/abc/link" : metadata;
+      ASSERT(vxcore_test::create_junction(root + "/outside", link));
+      expected = VXCORE_ERR_IO;
+    } else if (hazard == Hazard::Protected) {
+      expected = VXCORE_ERR_NOT_FOUND;
+    } else {
+      const auto path = root + "/vx_notebook/contents/top/vx.json";
+      auto config = nlohmann::json::parse(ReadTestFile(path));
+      config["files"][0]["metadata"]["encrypted"] = true;
+      ASSERT(WriteTestFile(path, config.dump()));
+    }
+    ASSERT_EQ(vxcore_notebook_open(ctx, root.c_str(), &notebook_id), VXCORE_OK);
+    const std::string root_before = ReadTestFile(root + "/vx_notebook/contents/vx.json");
+    const std::string top_before = ReadTestFile(root + "/vx_notebook/contents/top/vx.json");
+    ASSERT_EQ(vxcore_node_delete(ctx, notebook_id, "top"), expected);
+    ASSERT_EQ(ReadTestFile(root + "/vx_notebook/contents/vx.json"), root_before);
+    ASSERT_EQ(ReadTestFile(root + "/vx_notebook/contents/top/vx.json"), top_before);
+    ASSERT_EQ(ReadTestFile(root + "/top/note.md"), "keep parent body");
+    ASSERT_EQ(ReadTestFile(root + "/top/abc/nested/keep.txt"), "keep child body");
+    ASSERT_TRUE(RootListingContainsFolder(ctx, notebook_id, "top"));
+    if (hazard == Hazard::Protected) {
+      ASSERT_EQ(ReadTestFile(root + "/top/secret.md.vne"), ciphertext);
+    }
+    if (!protected_path.empty()) {
+      ASSERT_EQ(ReadTestFile(protected_path), "do not discard protected bytes");
+    }
+    if (hazard == Hazard::Metadata) {
+      ASSERT_EQ(ReadTestFile(metadata + "/nested/vx.json"), grandchild_config);
+    }
+    if (!link.empty()) vxcore_test::remove_reparse_dir(link);
+    vxcore_string_free(notebook_id);
+    vxcore_context_destroy(ctx);
+    cleanup_test_dir(root);
+  }
+  return 0;
+}
+
+#ifdef _WIN32
+int test_folder_delete_missing_metadata_file_reparse() {
+  const std::string root = get_test_path("test_delete_metadata_file_reparse_nb");
+  cleanup_test_dir(root);
+  VxCoreContextHandle ctx = nullptr;
+  ASSERT_EQ(vxcore_context_create(nullptr, &ctx), VXCORE_OK);
+  char *notebook_id = nullptr;
+  ASSERT_EQ(vxcore_notebook_create(ctx, root.c_str(), R"({"name":"File reparse"})",
+                                   VXCORE_NOTEBOOK_BUNDLED, &notebook_id),
+            VXCORE_OK);
+  char *id = nullptr;
+  ASSERT_EQ(vxcore_folder_create(ctx, notebook_id, ".", "top", &id), VXCORE_OK);
+  vxcore_string_free(id);
+  ASSERT_EQ(vxcore_folder_create(ctx, notebook_id, "top", "abc", &id), VXCORE_OK);
+  vxcore_string_free(id);
+  ASSERT(WriteTestFile(root + "/outside.txt", "keep linked body"));
+  std::error_code ec;
+  std::filesystem::create_symlink(utf8_to_fs_path(root + "/outside.txt"),
+                                  utf8_to_fs_path(root + "/top/abc/link.txt"), ec);
+  ASSERT_EQ(vxcore_notebook_close(ctx, notebook_id), VXCORE_OK);
+  vxcore_string_free(notebook_id);
+  if (ec) {
+    std::cout << "  SKIP file symlink: " << ec.message() << std::endl;
+  } else {
+    cleanup_test_dir(root + "/vx_notebook/contents/top/abc");
+    ASSERT_EQ(vxcore_notebook_open(ctx, root.c_str(), &notebook_id), VXCORE_OK);
+    ASSERT_EQ(vxcore_node_delete(ctx, notebook_id, "top"), VXCORE_OK);
+    ASSERT_EQ(ReadTestFile(root + "/outside.txt"), "keep linked body");
+    ASSERT_EQ(ReadTestFile(root + "/vx_notebook/recycle_bin/top/abc/link.txt"), "keep linked body");
+    vxcore_string_free(notebook_id);
+  }
+  vxcore_context_destroy(ctx);
+  cleanup_test_dir(root);
+  return 0;
+}
+#endif
 
 int test_phantom_folder_delete() {
   std::cout << "  Running test_phantom_folder_delete..." << std::endl;
@@ -10929,6 +11137,11 @@ int main() {
   // Recycle bin tests
   RUN_TEST(test_recycle_bin_file_delete);
   RUN_TEST(test_recycle_bin_folder_delete);
+  RUN_TEST(test_folder_delete_missing_descendant_metadata);
+  RUN_TEST(test_folder_delete_missing_metadata_protection);
+#ifdef _WIN32
+  RUN_TEST(test_folder_delete_missing_metadata_file_reparse);
+#endif
   RUN_TEST(test_phantom_folder_delete);
   RUN_TEST(test_phantom_folder_with_descendants_delete);
   RUN_TEST(test_delete_truly_nonexistent_folder);

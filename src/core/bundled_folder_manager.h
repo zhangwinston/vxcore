@@ -189,7 +189,9 @@ class BundledFolderManager : public FolderManager {
   }
   void TransferInvalidateCache(const std::string &folder_path) { InvalidateCache(folder_path); }
 
-  VxCoreError ContainsEncryptedNotes(const std::string &folder_path, bool &out_contains);
+  VxCoreError ContainsEncryptedNotes(const std::string &folder_path, bool &out_contains,
+                                     bool allow_missing_config);
+
  private:
   VxCoreError RecycleProtectedNode(const std::string &path, bool folder);
   VxCoreError MoveProtectedFile(const std::string &path, const std::string &destination_folder);

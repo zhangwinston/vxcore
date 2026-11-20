@@ -61,6 +61,46 @@ static bool HasEncryptedSuffix(const std::string &name) {
 }
 namespace {
 
+// Missing index metadata cannot certify a subtree as ordinary. Inspect every
+// physical entry, without following directory links or hydrating cloud files.
+VxCoreError CheckUnindexedContentProtection(const fs::path &path) {
+  std::error_code ec;
+  const auto status = fs::symlink_status(path, ec);
+  if (ec == std::errc::no_such_file_or_directory) return VXCORE_OK;
+  if (ec) return VXCORE_ERR_IO;
+  if (status.type() == fs::file_type::not_found) return VXCORE_OK;
+  const auto reparse = CheckReparsePoint(PathToUtf8(path));
+  if (reparse == ReparseState::kError) return VXCORE_ERR_IO;
+  bool directory = fs::is_directory(status);
+  if (reparse == ReparseState::kYes) {
+#ifdef _WIN32
+    const auto attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+      return VXCORE_ERR_IO;
+    }
+    directory = false;
+#else
+    return VXCORE_ERR_IO;
+#endif
+  } else if (!directory && !fs::is_regular_file(status)) {
+    return VXCORE_ERR_IO;
+  }
+  if (!directory) {
+    auto name = PathToUtf8(path.filename());
+    if (name.size() >= 5 &&
+        std::equal(name.end() - 5, name.end(), ".vswp",
+                   [](unsigned char a, char b) { return std::tolower(a) == b; })) {
+      name.resize(name.size() - 5);
+    }
+    return HasEncryptedSuffix(name) ? VXCORE_ERR_ENCRYPTION_FORMAT : VXCORE_OK;
+  }
+  for (fs::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+    const auto error = CheckUnindexedContentProtection(it->path());
+    if (error != VXCORE_OK) return error;
+  }
+  return ec ? VXCORE_ERR_IO : VXCORE_OK;
+}
+
 // Helper to convert FolderConfig to StoreFolderRecord
 StoreFolderRecord ToStoreFolderRecord(const FolderConfig &config, const std::string &parent_id) {
   StoreFolderRecord record;
@@ -458,7 +498,7 @@ VxCoreError BundledFolderManager::DeleteFolder(const std::string &folder_path) {
   }
   if (content_exists) {
     bool encrypted = false;
-    const auto protection = ContainsEncryptedNotes(clean_folder_path, encrypted);
+    const auto protection = ContainsEncryptedNotes(clean_folder_path, encrypted, true);
     if (protection != VXCORE_OK) return protection;
     if (encrypted) return RecycleProtectedNode(clean_folder_path, true);
   }
@@ -1021,11 +1061,30 @@ VxCoreError BundledFolderManager::ProcessCopiedFolderTree(const std::string &des
   return VXCORE_OK;
 }
 
-VxCoreError BundledFolderManager::ContainsEncryptedNotes(
-    const std::string &folder_path, bool &out_contains) {
+VxCoreError BundledFolderManager::ContainsEncryptedNotes(const std::string &folder_path,
+                                                         bool &out_contains,
+                                                         bool allow_missing_config) {
   out_contains = false;
   FolderConfig *config = nullptr;
   auto error = GetFolderConfig(folder_path, &config);
+  if (error == VXCORE_ERR_NOT_FOUND && allow_missing_config) {
+    // Never discard surviving descendant metadata whose protection records we
+    // cannot traverse. An absent or empty metadata directory has no such records.
+    const auto metadata = PathFromUtf8(GetConfigPath(folder_path)).parent_path();
+    std::error_code ec;
+    const auto status = fs::symlink_status(metadata, ec);
+    if (ec && ec != std::errc::no_such_file_or_directory) return VXCORE_ERR_IO;
+    if (!ec && status.type() != fs::file_type::not_found) {
+      if (CheckReparsePoint(PathToUtf8(metadata)) != ReparseState::kNo ||
+          !fs::is_directory(status)) {
+        return VXCORE_ERR_IO;
+      }
+      const bool empty = fs::is_empty(metadata, ec);
+      if (ec) return VXCORE_ERR_IO;
+      if (!empty) return VXCORE_ERR_NOT_FOUND;
+    }
+    return CheckUnindexedContentProtection(PathFromUtf8(GetContentPath(folder_path)));
+  }
   if (error != VXCORE_OK) return error;
   for (const auto &file : config->files) {
     const auto protection = file.CheckProtectionMetadata();
@@ -1034,7 +1093,8 @@ VxCoreError BundledFolderManager::ContainsEncryptedNotes(
   }
   for (const auto &child : config->folders) {
     bool encrypted = false;
-    error = ContainsEncryptedNotes(ConcatenatePaths(folder_path, child), encrypted);
+    error = ContainsEncryptedNotes(ConcatenatePaths(folder_path, child), encrypted,
+                                   allow_missing_config);
     if (error != VXCORE_OK) return error;
     out_contains = out_contains || encrypted;
   }
@@ -1095,7 +1155,7 @@ VxCoreError BundledFolderManager::CopyFolder(const std::string &src_path,
     return error;
   }
   bool encrypted = false;
-  error = ContainsEncryptedNotes(clean_src_path, encrypted);
+  error = ContainsEncryptedNotes(clean_src_path, encrypted, false);
   if (error != VXCORE_OK) return error;
   if (encrypted) {
     nlohmann::json events;
